@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="nav_hud">HUD</string>
+    <string name="nav_sensors">Gestures</string>
+    <string name="nav_sentry">Sentry</string>
+    <string name="nav_workflows">Agent</string>
+    <string name="nav_vault">Vault</string>
+    <string name="hud_subtitle">PRIVATE AGENT • AUTONOMOUS HUD</string>
+    <string name="hud_input_hint">Issue command or ask J.A.R.V.I.S…</string>
+    <string name="error_empty_command">Please enter or speak a command first.</string>
+    <string name="error_mic_permission">Microphone permission is required for voice commands.</string>
+    <string name="error_camera_permission">Camera permission enables silent intruder capture in Sentry Mode.</string>
+    <string name="sentry_armed_warning">Warning. Unauthorized movement detected. Sentry protocol engaged.</string>
+</resources>

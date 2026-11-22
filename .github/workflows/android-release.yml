@@ -1,0 +1,362 @@
+name: Android Release Build & Publish
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish GitHub Release (creates tag if absent only for tag-matched build)'
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Tag name when manually publishing (e.g. v1.2.0)'
+        required: false
+        type: string
+        default: ''
+      is_prerelease:
+        description: 'Mark GitHub Release as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build_and_verify:
+    name: Test, Lint, Build & Verify Release APKs
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.app_meta.outputs.version_name }}
+      version_code: ${{ steps.app_meta.outputs.version_code }}
+      application_id: ${{ steps.app_meta.outputs.application_id }}
+      release_tag: ${{ steps.app_meta.outputs.release_tag }}
+      is_prerelease: ${{ steps.app_meta.outputs.is_prerelease }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect Android metadata & validate tag alignment
+        id: app_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID=$(grep -E 'applicationId\s*=' app/build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_NAME=$(grep -E 'versionName\s*=' app/build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep -E 'versionCode\s*=' app/build.gradle.kts | head -n1 | sed -E 's/.*=\s*([0-9]+).*/\1/')
+          echo "Application ID: $APP_ID"
+          echo "Version Name:   $VERSION_NAME"
+          echo "Version Code:   $VERSION_CODE"
+
+          if [[ "$APP_ID" != "com.aistudio.jarvisagent.vpxkrm" ]]; then
+            echo "::error::Unexpected applicationId: $APP_ID"
+            exit 1
+          fi
+
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="v${VERSION_NAME}"
+          fi
+
+          CLEAN_TAG_VER="${TAG#v}"
+          BASE_TAG_VER="${CLEAN_TAG_VER%%-*}"
+          if [[ "${{ github.ref_type }}" == "tag" && "$BASE_TAG_VER" != "$VERSION_NAME" ]]; then
+            echo "::error::Git tag ($TAG) does not match versionName ($VERSION_NAME) in app/build.gradle.kts"
+            exit 1
+          fi
+
+          IS_PRERELEASE="${{ inputs.is_prerelease }}"
+          if [[ "$TAG" == *"-"* ]]; then
+            IS_PRERELEASE="true"
+          fi
+
+          echo "application_id=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Verify no plaintext secrets in repository workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rnE "sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|ghp_[A-Za-z0-9]{20,}|BEGIN (RSA|EC|PRIVATE) KEY" app/src/main/ .github/; then
+            echo "::error::Potential secret pattern detected in tracked source!"
+            exit 1
+          fi
+
+      - name: Run unit & Robolectric tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: Run Android Lint
+        run: gradle :app:lintDebug --no-daemon
+
+      - name: Upload test & lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-lint-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/lint-results-debug.html
+          if-no-files-found: warn
+
+      - name: Validate release signing secrets
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CFG_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_B64:-}" || -z "${STORE_PW:-}" || -z "${KEY_PW:-}" ]]; then
+            echo "::error::Missing required signing secrets (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD)."
+            exit 1
+          fi
+          if [[ -n "${CFG_ALIAS:-}" && "$CFG_ALIAS" != "upload" ]]; then
+            echo "::error::ANDROID_KEY_ALIAS must be 'upload' to match app/build.gradle.kts signingConfigs.release."
+            exit 1
+          fi
+
+      - name: Decode release keystore securely
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_B64" | base64 --decode > "${RUNNER_TEMP}/my-upload-key.jks"
+          chmod 600 "${RUNNER_TEMP}/my-upload-key.jks"
+          if [[ ! -s "${RUNNER_TEMP}/my-upload-key.jks" ]]; then
+            echo "::error::Decoded keystore is empty."
+            exit 1
+          fi
+
+      - name: Build signed release APKs (arm64-v8a, armeabi-v7a, universal)
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle :app:assembleRelease -PenableAbiSplits=true --no-daemon
+
+      - name: Clean up temporary keystore immediately
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/my-upload-key.jks"
+
+      - name: Verify release APKs, signatures & generate checksums
+        shell: bash
+        env:
+          VERSION_NAME: ${{ steps.app_meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.app_meta.outputs.version_code }}
+          APP_ID: ${{ steps.app_meta.outputs.application_id }}
+          RELEASE_TAG: ${{ steps.app_meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -maxdepth 1 -mindepth 1 | sort -V | tail -n 1)
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          AAPT2="${BUILD_TOOLS_DIR}/aapt2"
+
+          OUT_DIR="${RUNNER_TEMP}/release-assets"
+          mkdir -p "$OUT_DIR"
+
+          APK_DIR="app/build/outputs/apk/release"
+          declare -A ABI_MAP=(
+            ["arm64-v8a"]="app-arm64-v8a-release.apk"
+            ["armeabi-v7a"]="app-armeabi-v7a-release.apk"
+            ["universal"]="app-universal-release.apk"
+          )
+
+          BUILT_COUNT=0
+          {
+            echo "Project: J.A.R.V.I.S. (PrivateAgent)"
+            echo "Application ID: ${APP_ID}"
+            echo "Version Name: ${VERSION_NAME}"
+            echo "Version Code: ${VERSION_CODE}"
+            echo "Git Tag: ${RELEASE_TAG}"
+            echo "Commit SHA: ${GITHUB_SHA}"
+            echo "Workflow Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Build Date (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "=== Verified APK Artifacts ==="
+          } > "${OUT_DIR}/BUILD_INFO.txt"
+
+          for ABI in arm64-v8a armeabi-v7a universal; do
+            SRC="${APK_DIR}/${ABI_MAP[$ABI]}"
+            if [[ ! -s "$SRC" ]]; then
+              echo "::error::Expected release APK missing or empty: $SRC"
+              exit 1
+            fi
+            DEST="${OUT_DIR}/JARVIS-${RELEASE_TAG}-${ABI}.apk"
+            cp "$SRC" "$DEST"
+            BUILT_COUNT=$((BUILT_COUNT + 1))
+
+            BADGING=$("$AAPT2" dump badging "$DEST")
+            PKG_NAME=$(echo "$BADGING" | grep -oE "package: name='[^']+'" | sed -E "s/.*'([^']+)'/\1/")
+            VER_CODE=$(echo "$BADGING" | grep -oE "versionCode='[^']+'" | sed -E "s/.*'([^']+)'/\1/")
+            VER_NAME=$(echo "$BADGING" | grep -oE "versionName='[^']+'" | sed -E "s/.*'([^']+)'/\1/")
+            MIN_SDK=$(echo "$BADGING" | grep -oE "sdkVersion:'[^']+'" | sed -E "s/.*'([^']+)'/\1/")
+
+            if [[ "$PKG_NAME" != "$APP_ID" || "$VER_CODE" != "$VERSION_CODE" || "$VER_NAME" != "$VERSION_NAME" ]]; then
+              echo "::error::Metadata mismatch in $DEST (pkg=$PKG_NAME code=$VER_CODE name=$VER_NAME)"
+              exit 1
+            fi
+
+            SIGN_INFO=$("$APKSIGNER" verify --verbose --print-certs "$DEST")
+            if echo "$SIGN_INFO" | grep -q "CN=Android Debug"; then
+              echo "::error::$DEST is signed with debug certificate! Refusing release."
+              exit 1
+            fi
+
+            SIZE_BYTES=$(stat -c%s "$DEST")
+            {
+              echo "- File: JARVIS-${RELEASE_TAG}-${ABI}.apk"
+              echo "  ABI: ${ABI}"
+              echo "  Size: ${SIZE_BYTES} bytes"
+              echo "  Package: ${PKG_NAME}"
+              echo "  Version: ${VER_NAME} (${VER_CODE}), minSdk=${MIN_SDK}"
+              echo "  Signature: VERIFIED (non-debug release key)"
+            } >> "${OUT_DIR}/BUILD_INFO.txt"
+          done
+
+          if [[ "$BUILT_COUNT" -eq 0 ]]; then
+            echo "::error::No release APKs produced."
+            exit 1
+          fi
+
+          (
+            cd "$OUT_DIR"
+            sha256sum JARVIS-*.apk BUILD_INFO.txt > SHA256SUMS.txt
+          )
+          cat "${OUT_DIR}/SHA256SUMS.txt"
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-release-${{ steps.app_meta.outputs.release_tag }}
+          path: ${{ runner.temp }}/release-assets/
+          if-no-files-found: error
+
+  publish_release:
+    name: Publish GitHub Release
+    needs: build_and_verify
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: jarvis-release-${{ needs.build_and_verify.outputs.release_tag }}
+          path: release-assets
+
+      - name: Prevent accidental overwrite of existing published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build_and_verify.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::GitHub Release for tag $TAG already exists. Bump version and create a new tag instead of overwriting."
+            exit 1
+          fi
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          TAG: ${{ needs.build_and_verify.outputs.release_tag }}
+          VER_NAME: ${{ needs.build_and_verify.outputs.version_name }}
+          VER_CODE: ${{ needs.build_and_verify.outputs.version_code }}
+          IS_PRE: ${{ needs.build_and_verify.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          LABEL="Stable"
+          if [[ "$IS_PRE" == "true" ]]; then
+            LABEL="Pre-release"
+          fi
+          DATE_UTC=$(date -u +%Y-%m-%d)
+          {
+            echo "## J.A.R.V.I.S. Android ${TAG} — ${LABEL} Release"
+            echo ""
+            echo "- **Version:** \`${VER_NAME}\` (versionCode \`${VER_CODE}\`)"
+            echo "- **Release Date (UTC):** ${DATE_UTC}"
+            echo "- **Package ID:** \`com.aistudio.jarvisagent.vpxkrm\`"
+            echo "- **Minimum Android Version:** Android 7.0 (API 24)"
+            echo "- **Supported Architectures:** \`arm64-v8a\` (recommended for modern phones), \`armeabi-v7a\`, \`universal\`"
+            echo ""
+            echo "### Highlights & Security Improvements"
+            echo "- Multi-provider AI core (Firebase Gemini, OpenAI, DeepSeek, OpenRouter, NVIDIA NIM, Local Ollama, Custom HTTPS)"
+            echo "- Structured OpenAI tool calling with strict schema validation, depth/loop guards, and operator confirmations"
+            echo "- Hermes persistent Room v2 memory engine + prompt-injection defense-in-depth (\`<untrusted_data>\` fencing)"
+            echo "- Android Keystore AES-256-GCM credential vault, token usage monitoring, and sanitized atomic backup export"
+            echo ""
+            echo "### Installation & Upgrade"
+            echo "1. Download **\`JARVIS-${TAG}-arm64-v8a.apk\`** (or \`JARVIS-${TAG}-universal.apk\` if unsure of phone CPU)."
+            echo "2. Tap the downloaded APK on your Android phone and allow installation from your browser/file manager if prompted."
+            echo "3. Existing users with the same package ID and signing key can update directly without losing Hermes memories or settings."
+            echo "4. See \`INSTALL_GUIDE_BN.md\` in the repository for step-by-step Bengali installation instructions."
+            echo ""
+            echo "### SHA-256 Checksums"
+            echo '```text'
+            cat release-assets/SHA256SUMS.txt
+            echo '```'
+          } > release-notes.md
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build_and_verify.outputs.release_tag }}
+          IS_PRE: ${{ needs.build_and_verify.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          PRE_FLAG=""
+          if [[ "$IS_PRE" == "true" ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+          TITLE_LABEL="Stable Release"
+          if [[ "$IS_PRE" == "true" ]]; then
+            TITLE_LABEL="Pre-release"
+          fi
+          gh release create "$TAG" \
+            release-assets/*.apk \
+            release-assets/SHA256SUMS.txt \
+            release-assets/BUILD_INFO.txt \
+            --title "J.A.R.V.I.S. Android ${TAG} — ${TITLE_LABEL}" \
+            --notes-file release-notes.md \
+            --target "${GITHUB_SHA}" \
+            $PRE_FLAG

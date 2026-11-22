@@ -1,0 +1,6 @@
+{
+  "name": "JARVIS",
+  "description": "Autonomous Liquid-Glass AI HUD Assistant with Voice Intelligence, Zero-Touch Air Gestures, and Sentry Mode",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
